@@ -53,6 +53,18 @@ WAV2VEC_DIR = os.environ.get("FLASHHEAD_WAV2VEC_DIR", "models/wav2vec2-base-960h
 DEFAULT_MODEL_TYPE = os.environ.get("FLASHHEAD_MODEL_TYPE", "lite")
 MAX_SESSIONS = int(os.environ.get("FLASHHEAD_MAX_SESSIONS", "2"))
 BASE_SEED = int(os.environ.get("FLASHHEAD_SEED", "42"))
+MATTING_ENABLED = os.environ.get("FLASHHEAD_MATTING", "0") == "1"
+SUB_BATCH = 3  # 每个子批次打包的帧数, 越小首帧到达越快
+
+_MATTING = None
+
+def get_matting():
+    """进程级单例：RVM 抠图模型只在首次需要时加载"""
+    global _MATTING
+    if _MATTING is None:
+        from flash_head.utils.matting import RVMMatting
+        _MATTING = RVMMatting(device="cuda")
+    return _MATTING
 
 # ---------------------------------------------------------------------------
 # Session
@@ -78,6 +90,9 @@ class Session:
     chunk_times: list = field(default_factory=list)
     total_frames: int = 0
     finished: bool = False
+
+    # 人像抠图（透明背景），RVMMatting 实例或 None
+    matting: object = None
 
     @property
     def slice_len(self) -> int:
@@ -138,9 +153,9 @@ class InitMsg(BaseModel):
     type: str = "init"
     cond_image: str       # base64 bytes or local file path
     cond_is_path: bool = False
-    model_type: str = DEFAULT_MODEL_TYPE
     base_seed: int = BASE_SEED
     use_face_crop: bool = False
+    transparent_bg: bool = False
 
 class InitResponse(BaseModel):
     type: str = "ready"
@@ -152,6 +167,7 @@ class InitResponse(BaseModel):
     tgt_fps: int
     sample_rate: int
     model_load_time_s: float
+    cond_preview: str = ""    # 透明背景开启时，返回抠图后的参考图 base64 PNG
 
 class AudioMsg(BaseModel):
     type: str = "audio_chunk"
@@ -165,6 +181,7 @@ class FrameMeta(BaseModel):
     height: int
     width: int
     processing_time_ms: float
+    fmt: str = "jpeg"     # jpeg | webp（webp 时帧为 RGBA 带 alpha）
 
 
 class FinishMsg(BaseModel):
@@ -230,7 +247,7 @@ def _do_init(msg: InitMsg, ckpt_dir: str, wav2vec_dir: str) -> tuple[Session, In
     pipeline = get_pipeline(
         world_size=1,
         ckpt_dir=ckpt_dir,
-        model_type=msg.model_type,
+        model_type=DEFAULT_MODEL_TYPE,
         wav2vec_dir=wav2vec_dir,
     )
     get_base_data(pipeline, cond, base_seed=msg.base_seed, use_face_crop=msg.use_face_crop)
@@ -259,6 +276,29 @@ def _do_init(msg: InitMsg, ckpt_dir: str, wav2vec_dir: str) -> tuple[Session, In
     session.audio_start_idx = audio_start
     session.audio_end_idx = audio_end
 
+    if msg.transparent_bg or MATTING_ENABLED:
+        try:
+            session.matting = get_matting()
+            gb = torch.cuda.memory_allocated(0) / 1024**3
+            logger.info(f"RVM matting enabled, GPU memory allocated: {gb:.1f} GB")
+        except Exception as e:
+            logger.error(f"RVM matting unavailable, fallback to JPEG: {e}")
+            session.matting = None
+
+    cond_preview_b64 = ""
+    if session.matting is not None:
+        try:
+            import glob
+            first = list(pipeline.cond_image_dict.keys())[0]
+            pil_img = pipeline.cond_image_dict[first]
+            arr = np.array(pil_img)
+            matted = session.matting.apply(arr[np.newaxis, ...])[0]  # (H, W, 4)
+            buf = io.BytesIO()
+            Image.fromarray(matted).save(buf, format='PNG')
+            cond_preview_b64 = base64.b64encode(buf.getvalue()).decode()
+        except Exception as e:
+            logger.warning(f"cond_preview matting failed: {e}")
+
     resp = InitResponse(
         session_id=session.id,
         frame_num=fn,
@@ -268,11 +308,13 @@ def _do_init(msg: InitMsg, ckpt_dir: str, wav2vec_dir: str) -> tuple[Session, In
         tgt_fps=fps,
         sample_rate=sr,
         model_load_time_s=round(load_time, 3),
+        cond_preview=cond_preview_b64,
     )
     return session, resp
 
 
-def _do_infer(session: Session, chunk: np.ndarray, chunk_idx: int) -> tuple[FrameMeta, bytes]:
+def _do_infer(session: Session, chunk: np.ndarray, chunk_idx: int) -> tuple[FrameMeta, list]:
+    """GPU 推理 + 抠图 + 编码，全部在 thread pool 中完成，返回 meta + 预编码子批次列表"""
     p = session.pipeline
     ip = session.infer_params
     mfn = ip['motion_frames_num']
@@ -294,16 +336,59 @@ def _do_infer(session: Session, chunk: np.ndarray, chunk_idx: int) -> tuple[Fram
     session.chunk_times.append(ms / 1000)
 
     n, h, w, c = video.shape
+    frames_np = video.cpu().numpy().astype(np.uint8)
+    fmt = 'jpeg'
+    if session.matting is not None:
+        try:
+            t_mat = time.time()
+            session.matting.reset()
+            frames_np = session.matting.apply(frames_np)
+            dt = time.time() - t_mat
+            vram = torch.cuda.memory_allocated(0) / 1024**3
+            logger.info(f"[matting] {n}f in {dt:.3f}s ({dt*1000/n:.1f}ms/f) GPU={vram:.1f}GB")
+            fmt = 'webp'
+        except Exception as e:
+            logger.error(f"matting.apply FAILED, disabling matting for session: {e}")
+            session.matting = None
     meta = FrameMeta(
         chunk_idx=chunk_idx,
         frames_count=n,
         height=h,
         width=w,
         processing_time_ms=round(ms, 1),
+        fmt=fmt,
     )
-    # Send raw uint8 bytes: N * H * W * C packed C-contiguous
-    raw_bytes = video.cpu().numpy().astype(np.uint8).tobytes()
-    return meta, raw_bytes
+    # 在 thread pool 中编码子批次——不阻塞事件循环接收音频
+    sub_batches = []
+    for i in range(0, n, SUB_BATCH):
+        parts = []
+        for j in range(i, min(i + SUB_BATCH, n)):
+            img = Image.fromarray(frames_np[j])
+            buf = io.BytesIO()
+            if fmt == 'webp':
+                img.save(buf, format='WEBP', quality=80)
+            else:
+                img.save(buf, format='JPEG', quality=75)
+            data = buf.getvalue()
+            parts.append(len(data).to_bytes(4, 'little') + data)
+        sub_batches.append(
+            len(parts).to_bytes(4, 'little') + b''.join(parts)
+        )
+    return meta, sub_batches
+
+
+def _encode_sub_batch(frames: np.ndarray, start: int, end: int, fmt: str) -> bytes:
+    parts = []
+    for j in range(start, end):
+        img = Image.fromarray(frames[j])
+        buf = io.BytesIO()
+        if fmt == 'webp':
+            img.save(buf, format='WEBP', quality=80)
+        else:
+            img.save(buf, format='JPEG', quality=75)
+        data = buf.getvalue()
+        parts.append(len(data).to_bytes(4, 'little') + data)
+    return len(parts).to_bytes(4, 'little') + b''.join(parts)
 
 
 def _do_finish(session: Session) -> SummaryMsg:
@@ -379,6 +464,7 @@ async def ws_stream(ws: WebSocket):
                 session.audio_start_idx = new_session.audio_start_idx
                 session.audio_end_idx = new_session.audio_end_idx
                 session.model_load_time = new_session.model_load_time
+                session.matting = new_session.matting
                 sessions_mgr._sessions.pop(new_session.id, None)
                 resp.session_id = old_id
                 await ws.send_text(resp.model_dump_json())
@@ -401,10 +487,11 @@ async def ws_stream(ws: WebSocket):
                 while len(session.audio_buffer) >= chunk_size:
                     chunk = np.array([session.audio_buffer.popleft() for _ in range(chunk_size)], dtype=np.float32)
                     loop = asyncio.get_event_loop()
-                    meta, raw_frames = await loop.run_in_executor(None, _do_infer, session, chunk, chunk_idx)
+                    meta, sub_batches = await loop.run_in_executor(None, _do_infer, session, chunk, chunk_idx)
                     chunk_idx += 1
                     await ws.send_text(meta.model_dump_json())
-                    await ws.send_bytes(raw_frames)
+                    for sub in sub_batches:
+                        await ws.send_bytes(sub)
 
             # --- FINISH ---
             elif mtype == "finish":
@@ -418,10 +505,11 @@ async def ws_stream(ws: WebSocket):
                         chunk[i] = session.audio_buffer.popleft()
                     logger.info(f"Sess {session.id} flushing {remaining} samples (+{pad_needed} pad)")
                     loop = asyncio.get_event_loop()
-                    meta, raw_frames = await loop.run_in_executor(None, _do_infer, session, chunk, chunk_idx)
+                    meta, sub_batches = await loop.run_in_executor(None, _do_infer, session, chunk, chunk_idx)
                     chunk_idx += 1
                     await ws.send_text(meta.model_dump_json())
-                    await ws.send_bytes(raw_frames)
+                    for sub in sub_batches:
+                        await ws.send_bytes(sub)
 
                 summary = _do_finish(session)
                 await ws.send_text(summary.model_dump_json())
@@ -429,11 +517,37 @@ async def ws_stream(ws: WebSocket):
                 logger.info(f"Sess {session.id} finished: {summary.total_frames}f, {summary.avg_fps}fps")
                 break
 
+            # --- FLUSH (pad buffer + generate, keep session alive) ---
+            elif mtype == "flush":
+                if session.initialized:
+                    remaining = len(session.audio_buffer)
+                    if remaining > 0:
+                        chunk_size = session.chunk_audio_len
+                        chunk = np.zeros(chunk_size, dtype=np.float32)
+                        for i in range(remaining):
+                            chunk[i] = session.audio_buffer.popleft()
+                        loop = asyncio.get_event_loop()
+                        meta, sub_batches = await loop.run_in_executor(None, _do_infer, session, chunk, chunk_idx)
+                        chunk_idx += 1
+                        await ws.send_text(meta.model_dump_json())
+                        for sub in sub_batches:
+                            await ws.send_bytes(sub)
+                    await ws.send_text(json.dumps({"type": "flushed"}))
+
+            # --- CLEAR (discard buffered audio, keep session alive) ---
+            elif mtype == "clear":
+                session.audio_buffer.clear()
+                if session.matting is not None:
+                    session.matting.reset()
+                await ws.send_text(json.dumps({"type": "cleared"}))
+
             # --- RESET (switch person or re-seed) ---
             elif mtype == "reset":
                 if session.initialized:
                     pn = msg.get("person_name", session.person_name)
                     session.pipeline.reset_person_name(pn)
+                    if session.matting is not None:
+                        session.matting.reset()
                     await ws.send_text(json.dumps({"type": "reset_ok", "person": pn}))
 
             else:
@@ -615,14 +729,6 @@ HTML_UI = r"""<!DOCTYPE html>
       <input type="file" ref="audioInput" accept="audio/wav,.wav" @change="onAudioChange" hidden>
     </div>
 
-    <div class="field" v-if="false">
-      <div class="label">Model</div>
-      <select v-model="modelType">
-        <option value="lite">⚡ Lite (RTX 4080+)</option>
-        <option value="pro">💎 Pro (2x RTX 5090)</option>
-      </select>
-    </div>
-
     <div style="margin-top:auto;">
       <div class="btn-row">
         <button class="btn btn-primary" style="flex:2" @click="start" :disabled="running || !audioFile">
@@ -666,7 +772,6 @@ createApp({
     const imagePreview = ref(null)
     const audioFile = ref(null)
     const audioPreview = ref(null)
-    const modelType = ref('lite')
     const running = ref(false)
     const hasResult = ref(false)
     const statusText = ref('Ready')
@@ -734,14 +839,10 @@ createApp({
       playbackTimer = setInterval(() => {
         if (!running.value && frameBuffer.length === 0) { stopPlayback(); return }
         if (playbackIdx >= frameBuffer.length) return // wait for more frames
-        const { data, w, h } = frameBuffer[playbackIdx]
+        const { bitmap, w, h } = frameBuffer[playbackIdx]
         canvasCtx.canvas.width = w; canvasCtx.canvas.height = h
-        const img = canvasCtx.createImageData(w, h)
-        for (let i = 0; i < w * h; i++) {
-          img.data[i*4] = data[i*3]; img.data[i*4+1] = data[i*3+1]
-          img.data[i*4+2] = data[i*3+2]; img.data[i*4+3] = 255
-        }
-        canvasCtx.putImageData(img, 0, 0)
+        canvasCtx.drawImage(bitmap, 0, 0)
+        bitmap.close()
         playbackIdx++
         currentFps.value = TARGET_FPS
       }, interval)
@@ -752,11 +853,21 @@ createApp({
       currentFps.value = ''
     }
 
-    function pushFrames(rawBytes, n, h, w) {
-      const frameSize = h * w * 3
-      const src = new Uint8Array(rawBytes)
-      for (let i = 0; i < n; i++) {
-        frameBuffer.push({ data: src.slice(i * frameSize, (i + 1) * frameSize), w, h })
+    // JPEG batch: [4B count][4B len][jpeg]...
+    async function pushFrames(rawBytes, n, h, w) {
+      const view = new DataView(rawBytes)
+      const count = view.getUint32(0, true)
+      let offset = 4
+      const blobs = []
+      for (let i = 0; i < count; i++) {
+        const len = view.getUint32(offset, true)
+        offset += 4
+        blobs.push(new Blob([new Uint8Array(rawBytes, offset, len)], { type: 'image/jpeg' }))
+        offset += len
+      }
+      const bitmaps = await Promise.all(blobs.map(b => createImageBitmap(b).catch(() => null)))
+      for (let i = 0; i < bitmaps.length; i++) {
+        if (bitmaps[i]) frameBuffer.push({ bitmap: bitmaps[i], w, h })
       }
     }
 
@@ -804,7 +915,6 @@ createApp({
           type: 'init',
           cond_image: imgB64 || 'examples/girl.png',
           cond_is_path: !imgB64,
-          model_type: modelType.value,
           base_seed: Math.floor(Math.random() * 1000)
         }))
       }
@@ -874,7 +984,7 @@ createApp({
 
     return {
       imgInput, audioInput, imageFile, imagePreview, audioFile, audioPreview,
-      modelType, running, hasResult, statusText, statusClass,
+      running, hasResult, statusText, statusClass,
       progress, currentFps, metrics,
       onImgChange, onAudioChange, onImgDrop, onAudioDrop,
       start, stop

@@ -35,9 +35,9 @@ def get_cond_image_dict(cond_image_path_or_dir, use_face_crop):
         import glob
         cond_image_list = glob.glob(os.path.join(cond_image_path_or_dir, "*.png"))
         cond_image_list.sort()
-        cond_image_dict = {cond_image.split("/")[-1].split(".")[0]: get_image(cond_image, use_face_crop) for cond_image in cond_image_list}
+        cond_image_dict = {os.path.splitext(os.path.basename(p))[0]: get_image(p, use_face_crop) for p in cond_image_list}
     else:
-        cond_image_dict = {cond_image_path_or_dir.split("/")[-1].split(".")[0]: get_image(cond_image_path_or_dir, use_face_crop)}
+        cond_image_dict = {os.path.splitext(os.path.basename(cond_image_path_or_dir))[0]: get_image(cond_image_path_or_dir, use_face_crop)}
     return cond_image_dict
 
 def timestep_transform(

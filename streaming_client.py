@@ -1,9 +1,9 @@
 """
-Python client for FlashHead streaming server (binary frames protocol).
+Python client for FlashHead streaming server (JPEG batch frames protocol).
 
 Protocol (per chunk):
   1. Server sends JSON: {"type": "frames_meta", "chunk_idx": N, "frames_count": N, "height": H, "width": W, "processing_time_ms": M}
-  2. Server sends binary: raw uint8 bytes of shape (N, H, W, C) packed C-contiguous
+  2. Server sends binary: [4B count][4B len][jpeg]... (each JPEG is one frame)
 
 Usage:
   python streaming_client.py --audio examples/podcast_sichuan_16k.wav
@@ -23,6 +23,20 @@ import wave
 import numpy as np
 import websockets
 from PIL import Image
+
+
+def parse_jpeg_batch(bin_data: bytes) -> np.ndarray:
+    """Parse [4B count][4B len][jpeg]... payload into (N, H, W, 3) uint8 array."""
+    count = int.from_bytes(bin_data[:4], 'little')
+    offset = 4
+    frames = []
+    for _ in range(count):
+        length = int.from_bytes(bin_data[offset:offset + 4], 'little')
+        offset += 4
+        img = Image.open(io.BytesIO(bin_data[offset:offset + length])).convert('RGB')
+        frames.append(np.array(img))
+        offset += length
+    return np.stack(frames)
 
 
 async def load_wav_as_float32(path: str) -> np.ndarray:
@@ -123,7 +137,7 @@ async def main():
             elif meta["type"] == "frames_meta":
                 bin_data = await ws.recv()
                 n, h, w = meta["frames_count"], meta["height"], meta["width"]
-                frames = np.frombuffer(bin_data, dtype=np.uint8).reshape(n, h, w, 3).copy()
+                frames = parse_jpeg_batch(bin_data)
                 all_frames.append(frames)
                 total_frames += n
                 fps = n / (meta["processing_time_ms"] / 1000) if meta["processing_time_ms"] > 0 else 0
@@ -146,7 +160,7 @@ async def main():
             if resp["type"] == "frames_meta":
                 bin_data = await ws.recv()
                 n, h, w = resp["frames_count"], resp["height"], resp["width"]
-                frames = np.frombuffer(bin_data, dtype=np.uint8).reshape(n, h, w, 3).copy()
+                frames = parse_jpeg_batch(bin_data)
                 all_frames.append(frames)
                 total_frames += n
                 print(f"  [Flush] Chunk {resp['chunk_idx']}: {n} frames, {resp['processing_time_ms']:.0f}ms")

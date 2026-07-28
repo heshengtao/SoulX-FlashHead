@@ -15,6 +15,23 @@
 <a href="https://huggingface.co/datasets/Soul-AILab/VividHead" target="_blank"><img src="https://img.shields.io/badge/🤗 Hugging Face-Dataset-blue" alt="Dataset"></a>&nbsp;
 </div>
 
+<p align="right"><b>English</b> | <a href="./README_CN.md">中文</a></p>
+
+> **🤖 For Users & AI Agents**
+>
+> This repo includes a deployment guide written specifically for AI agents: **[DEPLOYMENT_FOR_AGENTS.md](./DEPLOYMENT_FOR_AGENTS.md)**.
+> To let an AI agent (OpenCode / Claude / Copilot, etc.) deploy this project automatically, feed it that document and have it follow the steps verbatim. Human operators should also refer to its verification checklist and troubleshooting table.
+
+## 🧩 Local Integration Features
+
+> The following features are local additions on top of the official release, mainly for integration with [super-agent-party](https://github.com/heshengtao/super-agent-party).
+
+- **Directory Mode (multi-person)**: the `init` message accepts a **directory path** as `cond_image` (with `cond_is_path: true`). All `*.png` files inside are loaded as separate persons; send `{"type":"reset","person_name":"<filename without extension>"}` to **hot-switch** the active person without re-initializing.
+- **Transparent Background / Server-side RVM Matting**: new `transparent_bg: bool` field in `init` (or env `FLASHHEAD_MATTING=1`). When enabled, each frame is matted in real time with RVM (Robust Video Matting, MobileNetV3) and encoded as **WebP (RGBA with alpha)** instead of JPEG; `frames_meta` carries a new `fmt` field (`jpeg` / `webp`) so clients know the encoding. The matting model is downloaded automatically via torch.hub on first use (~14.5MB) and falls back to JPEG on failure.
+- **Windows path fix**: person_name resolution in directory mode previously returned the full path on Windows; fixed to use `os.path.basename`.
+
+See [API.md](./API.md) and [DEPLOYMENT_FOR_AGENTS.md](./DEPLOYMENT_FOR_AGENTS.md) for protocol details.
+
 ## ⚡ Highlights
 - **Model_Lite** [Released](https://huggingface.co/Soul-AILab/SoulX-FlashHead-1_3B/tree/main/Model_Lite) get 96 FPS, or 3-concurrent real-time(25+ FPS) streaming on single RTX4090.
 - **Model_Pro** [Released](https://huggingface.co/Soul-AILab/SoulX-FlashHead-1_3B/tree/main/Model_Pro) can generate high-quality videos with 10.8 FPS on single RTX4090, or real-time(25+ FPS) on two RTX5090.
