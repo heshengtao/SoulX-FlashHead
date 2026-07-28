@@ -92,18 +92,9 @@ CONDA_PYTHON="$(conda run -n "${ENV_NAME}" which python 2>/dev/null)"
 echo -e "  ${BOLD}Python:${NC} ${CONDA_PYTHON}"
 echo -e "  ${BOLD}Version:${NC} $(conda run -n "${ENV_NAME}" python --version 2>&1)"
 
-# Helper to run pip in the env with live output
+# Run pip with full live output
 pip_run() {
-    conda run -n "${ENV_NAME}" --no-capture-output python -m pip "$@" 2>&1 | while IFS= read -r line; do
-        if [[ "$line" =~ Downloading|Installing|Successfully|ERROR|Collecting ]]; then
-            echo -e "        ${line}"
-        fi
-    done
-    return ${PIPESTATUS[0]}
-}
-
-pip_run_quiet() {
-    conda run -n "${ENV_NAME}" --no-capture-output python -m pip "$@" 2>&1 | tail -5
+    conda run -n "${ENV_NAME}" --no-capture-output python -m pip "$@" 2>&1
     return ${PIPESTATUS[0]}
 }
 
@@ -151,13 +142,14 @@ sed '/nvidia-nccl-cu12/d' requirements.txt > "$TMP_REQ"
 DEPS_COUNT=$(grep -vc '^\s*#' "$TMP_REQ" || echo "?")
 log "Installing ~${DEPS_COUNT} packages..."
 
-if pip_run_quiet install -r "$TMP_REQ"; then
+if pip_run install -r "$TMP_REQ"; then
     ok "Dependencies installed"
 else
     warn "Some packages failed, retrying one by one..."
     while IFS= read -r pkg; do
         [[ -z "$pkg" || "$pkg" == \#* ]] && continue
-        conda run -n "${ENV_NAME}" --no-capture-output python -m pip install "$pkg" 2>&1 | tail -1 || warn "  Failed: $pkg"
+        echo -e "        Retrying: ${pkg}"
+        conda run -n "${ENV_NAME}" --no-capture-output python -m pip install "$pkg" 2>&1 || warn "  Failed: $pkg"
     done < "$TMP_REQ"
 fi
 rm -f "$TMP_REQ"
@@ -181,7 +173,7 @@ if conda run -n "${ENV_NAME}" python -c "import flash_attn; print(flash_attn.__v
 else
     FA_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiFALSE-cp310-cp310-linux_x86_64.whl"
     log "Installing FlashAttention (prebuilt wheel)..."
-    if pip_run_quiet install "$FA_URL"; then
+    if pip_run install "$FA_URL"; then
         ok "FlashAttention 2.8.0 installed"
     else
         warn "Prebuilt wheel failed, trying build from source (slower)..."
@@ -196,7 +188,7 @@ if conda run -n "${ENV_NAME}" python -c "import triton; print(triton.__version__
     ok "Triton already installed"
 else
     log "Installing Triton..."
-    if pip_run_quiet install triton; then
+    if pip_run install triton; then
         ok "Triton installed"
     else
         warn "Triton install failed (torch.compile will use fallback)"
