@@ -29,8 +29,10 @@ def get_pipeline(world_size, ckpt_dir, model_type, wav2vec_dir):
     motion_frames_num = (motion_frames_latent_num - 1) * pipeline.config.vae_stride[0] + 1
     infer_params['motion_frames_num'] = motion_frames_num
 
-    # TODO: move to args
-    if model_type == "pretrained":
+    # sample_steps: 优先从配置文件读取，未配置时根据模型类型回退默认值
+    if 'sample_steps' in infer_params:
+        pass  # already set from yaml
+    elif model_type == "pretrained":
         infer_params['sample_steps'] = 20
     else:
         infer_params['sample_steps'] = 4
