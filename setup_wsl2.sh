@@ -44,6 +44,9 @@ fi
 
 # Ensure conda is usable in this script
 eval "$(conda shell.bash hook)" 2>/dev/null || true
+# Accept ToS if needed (newer conda versions)
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
 
 # ---- 1. Conda env ----
 log "Step 1/6: Conda environment"
