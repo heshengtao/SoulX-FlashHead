@@ -19,7 +19,7 @@ echo "  SoulX-FlashHead WSL2 Installer"
 echo "========================================"
 echo ""
 
-# ---- 0. Check system ----
+# ---- 0. Check system + install conda if needed ----
 log "Checking system..."
 if ! command -v nvidia-smi &>/dev/null; then
     err "nvidia-smi not found. Is this WSL2 with NVIDIA driver?"
@@ -27,6 +27,23 @@ fi
 nvidia-smi --query-gpu=name --format=csv,noheader | head -1
 VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
 ok "GPU OK, VRAM: ${VRAM} MiB"
+
+if ! command -v conda &>/dev/null; then
+    log "Conda not found, installing Miniconda..."
+    MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+    TMP_INSTALLER="/tmp/miniconda_$$.sh"
+    wget -qO "$TMP_INSTALLER" "$MINICONDA_URL" || curl -sL -o "$TMP_INSTALLER" "$MINICONDA_URL"
+    bash "$TMP_INSTALLER" -b -u -p "$HOME/miniconda3"
+    rm -f "$TMP_INSTALLER"
+    eval "$("$HOME/miniconda3/bin/conda" shell.bash hook)"
+    "$HOME/miniconda3/bin/conda" init bash >/dev/null 2>&1
+    ok "Miniconda installed to ~/miniconda3"
+    ok "Please restart your shell and run this script again."
+    exit 0
+fi
+
+# Ensure conda is usable in this script
+eval "$(conda shell.bash hook)" 2>/dev/null || true
 
 # ---- 1. Conda env ----
 log "Step 1/6: Conda environment"
