@@ -27,8 +27,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
-# Windows: disable torch.compile before importing flash_head (Triton not available on win32)
-if sys.platform == "win32":
+# 默认禁用 torch.compile（需 Triton + C 编译器），通过 FLASHHEAD_COMPILE=1 启用
+if os.environ.get("FLASHHEAD_COMPILE") != "1":
     import flash_head.src.pipeline.flash_head_pipeline as _pipe_cfg
     _pipe_cfg.COMPILE_MODEL = False
     _pipe_cfg.COMPILE_VAE = False
