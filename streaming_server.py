@@ -56,6 +56,14 @@ BASE_SEED = int(os.environ.get("FLASHHEAD_SEED", "42"))
 MATTING_ENABLED = os.environ.get("FLASHHEAD_MATTING", "0") == "1"
 SUB_BATCH = 3  # 每个子批次打包的帧数, 越小首帧到达越快
 
+def _resolve_path(path: str) -> str:
+    """将 Windows 路径转为 WSL 路径（当在 Linux 下运行时）。"""
+    if sys.platform == "linux" and re.match(r'^[A-Z]:[\\/]', path):
+        drive = path[0].lower()
+        rest = path[2:].replace('\\', '/')
+        return f'/mnt/{drive}/{rest}'
+    return path
+
 _MATTING = None
 
 def get_matting():
@@ -236,7 +244,7 @@ def _do_init(msg: InitMsg, ckpt_dir: str, wav2vec_dir: str) -> tuple[Session, In
 
     # Resolve image
     if msg.cond_is_path:
-        cond = msg.cond_image
+        cond = _resolve_path(msg.cond_image)
     else:
         raw_img = base64.b64decode(msg.cond_image)
         img_path = os.path.join(os.environ.get("TEMP", "/tmp"), f"_flashhead_{uuid.uuid4().hex[:8]}.png")
