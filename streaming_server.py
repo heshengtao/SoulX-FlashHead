@@ -64,12 +64,6 @@ def _resolve_path(path: str) -> str:
         return f'/mnt/{drive}/{rest}'
     return path
 
-
-def _download_image(url: str, dest: str):
-    """从 HTTP URL 下载图片到本地文件。"""
-    import urllib.request
-    urllib.request.urlretrieve(url, dest)
-
 _MATTING = None
 
 def get_matting():
@@ -165,9 +159,8 @@ sessions_mgr = SessionManager()
 
 class InitMsg(BaseModel):
     type: str = "init"
-    cond_image: str = ""       # base64 bytes or local file path (legacy)
+    cond_image: str       # base64 bytes or local file path
     cond_is_path: bool = False
-    cond_url: str = ""         # HTTP URL to download the image (preferred)
     base_seed: int = BASE_SEED
     use_face_crop: bool = False
     transparent_bg: bool = False
@@ -250,12 +243,7 @@ def _do_init(msg: InitMsg, ckpt_dir: str, wav2vec_dir: str) -> tuple[Session, In
     t0 = time.time()
 
     # Resolve image
-    if msg.cond_url:
-        # Download from URL — works cross-device, no filesystem shared needed
-        img_path = os.path.join(os.environ.get("TEMP", "/tmp"), f"_flashhead_{uuid.uuid4().hex[:8]}.png")
-        _download_image(msg.cond_url, img_path)
-        cond = img_path
-    elif msg.cond_is_path:
+    if msg.cond_is_path:
         cond = _resolve_path(msg.cond_image)
     else:
         raw_img = base64.b64decode(msg.cond_image)
