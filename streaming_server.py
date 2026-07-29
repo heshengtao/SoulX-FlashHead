@@ -25,6 +25,7 @@ import time
 import uuid
 import wave
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -55,7 +56,11 @@ DEFAULT_MODEL_TYPE = os.environ.get("FLASHHEAD_MODEL_TYPE", "lite")
 MAX_SESSIONS = int(os.environ.get("FLASHHEAD_MAX_SESSIONS", "2"))
 BASE_SEED = int(os.environ.get("FLASHHEAD_SEED", "42"))
 MATTING_ENABLED = os.environ.get("FLASHHEAD_MATTING", "0") == "1"
-SUB_BATCH = 3  # 每个子批次打包的帧数, 越小首帧到达越快
+_MATTING_RVM_DS = float(os.environ.get("FLASHHEAD_MATTING_RVM_DS", "0.5"))
+_MATTING_RVM_KI = int(os.environ.get("FLASHHEAD_MATTING_RVM_KI", "5"))
+SUB_BATCH = int(os.environ.get("FLASHHEAD_SUB_BATCH", "6"))
+WEBP_QUALITY = int(os.environ.get("FLASHHEAD_WEBP_QUALITY", "65"))
+_ENCODE_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 def _resolve_path(path: str) -> str:
     """将 Windows 路径转为 WSL 路径（当在 Linux 下运行时）。"""
@@ -66,13 +71,34 @@ def _resolve_path(path: str) -> str:
     return path
 
 _MATTING = None
+_MATTING_MODEL = os.environ.get("FLASHHEAD_MATTING_MODEL", "modnet").lower()
 
 def get_matting():
-    """进程级单例：RVM 抠图模型只在首次需要时加载"""
+    """进程级单例：抠图模型只在首次需要时加载。
+    通过 FLASHHEAD_MATTING_MODEL 选择: modnet (默认, 自动回退到 rvm) 或 rvm """
     global _MATTING
-    if _MATTING is None:
-        from flash_head.utils.matting import RVMMatting
-        _MATTING = RVMMatting(device="cuda")
+    if _MATTING is not None:
+        return _MATTING
+
+    def _try_load(name, loader):
+        try:
+            m = loader()
+            logger.info(f"Matting model loaded: {name}")
+            return m
+        except Exception as e:
+            logger.warning(f"Failed to load {name}: {e}")
+            return None
+
+    if _MATTING_MODEL == "modnet":
+        from flash_head.utils.matting import MODNetMatting
+        m = _try_load("modnet", lambda: MODNetMatting(device="cuda"))
+        if m is not None:
+            _MATTING = m
+            return _MATTING
+        logger.warning("MODNet unavailable, falling back to RVM...")
+
+    from flash_head.utils.matting import RVMMatting
+    _MATTING = _try_load("rvm", lambda: RVMMatting(device="cuda"))
     return _MATTING
 
 # ---------------------------------------------------------------------------
@@ -289,7 +315,7 @@ def _do_init(msg: InitMsg, ckpt_dir: str, wav2vec_dir: str) -> tuple[Session, In
         try:
             session.matting = get_matting()
             gb = torch.cuda.memory_allocated(0) / 1024**3
-            logger.info(f"RVM matting enabled, GPU memory allocated: {gb:.1f} GB")
+            logger.info(f"Matting enabled ({_MATTING_MODEL}), GPU memory: {gb:.1f} GB")
         except Exception as e:
             logger.error(f"RVM matting unavailable, fallback to JPEG: {e}")
             session.matting = None
@@ -338,12 +364,6 @@ def _do_infer(session: Session, chunk: np.ndarray, chunk_idx: int) -> tuple[Fram
     video = run_pipeline(p, emb)
     video = video[mfn:]  # (N, H, W, C) uint8
 
-    torch.cuda.synchronize()
-    ms = (time.time() - t0) * 1000
-
-    session.total_frames += video.shape[0]
-    session.chunk_times.append(ms / 1000)
-
     n, h, w, c = video.shape
     frames_np = video.cpu().numpy().astype(np.uint8)
     fmt = 'jpeg'
@@ -359,6 +379,12 @@ def _do_infer(session: Session, chunk: np.ndarray, chunk_idx: int) -> tuple[Fram
         except Exception as e:
             logger.error(f"matting.apply FAILED, disabling matting for session: {e}")
             session.matting = None
+
+    torch.cuda.synchronize()
+    ms = (time.time() - t0) * 1000
+
+    session.total_frames += video.shape[0]
+    session.chunk_times.append(ms / 1000)
     meta = FrameMeta(
         chunk_idx=chunk_idx,
         frames_count=n,
@@ -367,34 +393,33 @@ def _do_infer(session: Session, chunk: np.ndarray, chunk_idx: int) -> tuple[Fram
         processing_time_ms=round(ms, 1),
         fmt=fmt,
     )
-    # 在 thread pool 中编码子批次——不阻塞事件循环接收音频
-    sub_batches = []
+    # 并行编码子批次
+    t_enc = time.time()
+    futures = {}
     for i in range(0, n, SUB_BATCH):
-        parts = []
-        for j in range(i, min(i + SUB_BATCH, n)):
-            img = Image.fromarray(frames_np[j])
-            buf = io.BytesIO()
-            if fmt == 'webp':
-                img.save(buf, format='WEBP', quality=80)
-            else:
-                img.save(buf, format='JPEG', quality=75)
-            data = buf.getvalue()
-            parts.append(len(data).to_bytes(4, 'little') + data)
-        sub_batches.append(
-            len(parts).to_bytes(4, 'little') + b''.join(parts)
-        )
+        end = min(i + SUB_BATCH, n)
+        futures[_ENCODE_EXECUTOR.submit(
+            _encode_sub_batch, frames_np, i, end, fmt, WEBP_QUALITY
+        )] = i
+    sub_batches = [None] * len(futures)
+    for fut in as_completed(futures):
+        idx = futures[fut]
+        pos = idx // SUB_BATCH
+        sub_batches[pos] = fut.result()
+    enc_ms = (time.time() - t_enc) * 1000
+    logger.info(f"[encode] {n}f {fmt} in {enc_ms:.0f}ms ({enc_ms/n:.1f}ms/f)")
     return meta, sub_batches
 
 
-def _encode_sub_batch(frames: np.ndarray, start: int, end: int, fmt: str) -> bytes:
+def _encode_sub_batch(frames: np.ndarray, start: int, end: int, fmt: str, quality: int = 75) -> bytes:
     parts = []
     for j in range(start, end):
         img = Image.fromarray(frames[j])
         buf = io.BytesIO()
         if fmt == 'webp':
-            img.save(buf, format='WEBP', quality=80)
+            img.save(buf, format='WEBP', quality=quality)
         else:
-            img.save(buf, format='JPEG', quality=75)
+            img.save(buf, format='JPEG', quality=quality)
         data = buf.getvalue()
         parts.append(len(data).to_bytes(4, 'little') + data)
     return len(parts).to_bytes(4, 'little') + b''.join(parts)
@@ -832,33 +857,60 @@ createApp({
     function setStatus(cls, txt) { statusClass.value = cls; statusText.value = txt }
 
     // ---- smooth playback ----
-    let frameBuffer = [], playbackTimer = null, playbackIdx = 0, canvasCtx = null
-    const TARGET_FPS = 25
+    let frameBuffer = [], rafId = null, playbackIdx = 0, canvasCtx = null
+    let playing = false, lastFrameTime = 0
+    const TARGET_FPS = 25, FRAME_MS = 1000 / TARGET_FPS, MIN_BUFFER = 4
+    // real FPS measurement
+    let fpsFrames = 0, fpsLastTime = 0
 
     function initPlayback() {
       const c = document.getElementById('videoCanvas')
       canvasCtx = c.getContext('2d')
-      frameBuffer = []; playbackIdx = 0
-      if (playbackTimer) { clearInterval(playbackTimer); playbackTimer = null }
+      frameBuffer = []; playbackIdx = 0; playing = false; lastFrameTime = 0
+      fpsFrames = 0; fpsLastTime = 0
+      if (rafId) { cancelAnimationFrame(rafId); rafId = null }
     }
 
-    function startPlayback() {
-      if (playbackTimer) return
-      const interval = 1000 / TARGET_FPS
-      playbackTimer = setInterval(() => {
-        if (!running.value && frameBuffer.length === 0) { stopPlayback(); return }
-        if (playbackIdx >= frameBuffer.length) return // wait for more frames
+    function _renderLoop(now) {
+      rafId = requestAnimationFrame(_renderLoop)
+      if (!playing && frameBuffer.length >= MIN_BUFFER) {
+        playing = true; lastFrameTime = now
+      }
+      if (!playing) return
+      if (!running.value && playbackIdx >= frameBuffer.length) { stopPlayback(); return }
+      if (lastFrameTime === 0) lastFrameTime = now
+      const elapsed = now - lastFrameTime
+
+      // real FPS measurement (update every ~500ms)
+      fpsFrames++
+      if (now - fpsLastTime >= 500) {
+        currentFps.value = Math.round(fpsFrames / ((now - fpsLastTime) / 1000))
+        fpsFrames = 0; fpsLastTime = now
+      }
+
+      if (elapsed < FRAME_MS) return // frame interval not reached
+      // draw as many frames as elapsed time allows (catch-up after buffer refill)
+      let ticks = Math.min(Math.floor(elapsed / FRAME_MS), frameBuffer.length - playbackIdx)
+      if (ticks === 0) { lastFrameTime = now; return }
+      for (let t = 0; t < ticks; t++) {
+        if (playbackIdx >= frameBuffer.length) break
         const { bitmap, w, h } = frameBuffer[playbackIdx]
         canvasCtx.canvas.width = w; canvasCtx.canvas.height = h
         canvasCtx.drawImage(bitmap, 0, 0)
         bitmap.close()
         playbackIdx++
-        currentFps.value = TARGET_FPS
-      }, interval)
+      }
+      lastFrameTime = now
+    }
+
+    function startPlayback() {
+      if (rafId) return
+      rafId = requestAnimationFrame(_renderLoop)
     }
 
     function stopPlayback() {
-      if (playbackTimer) { clearInterval(playbackTimer); playbackTimer = null }
+      playing = false
+      if (rafId) { cancelAnimationFrame(rafId); rafId = null }
       currentFps.value = ''
     }
 
@@ -899,7 +951,8 @@ createApp({
     function reset() {
       progress.value = 0; currentFps.value = ''; metrics.value = null; hasResult.value = false
       stopPlayback()
-      frameBuffer = []; playbackIdx = 0; canvasCtx = null
+      frameBuffer = []; playbackIdx = 0; canvasCtx = null; playing = false; lastFrameTime = 0
+      fpsFrames = 0; fpsLastTime = 0
       const c = document.getElementById('videoCanvas')
       if (c) { const ctx = c.getContext('2d'); ctx.clearRect(0, 0, 512, 512) }
     }
@@ -932,12 +985,12 @@ createApp({
         if (e.data instanceof ArrayBuffer) {
           if (!lastMeta) return
           const { frames_count, height, width, chunk_idx, processing_time_ms } = lastMeta
+          lastMeta = null
           totalFrames += frames_count; totalMs += processing_time_ms
           progress.value = Math.min(99, Math.round((chunk_idx / (audioFile.value.size / 40000)) * 100))
-          pushFrames(e.data, frames_count, height, width)
+          await pushFrames(e.data, frames_count, height, width)
           hasResult.value = true
-          if (chunk_idx === 0) startPlayback() // start on first chunk
-          lastMeta = null
+          if (chunk_idx === 0) startPlayback()
         } else {
           const m = JSON.parse(e.data)
           if (m.type === 'ready') {
