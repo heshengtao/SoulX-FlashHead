@@ -17,10 +17,13 @@
 
 <p align="right"><b>English</b> | <a href="./README_CN.md">中文</a></p>
 
-> **🤖 For Users & AI Agents**
+> **🤖 Using an AI coding agent (OpenCode, Claude Code, etc.)?**
 >
-> This repo includes a deployment guide written specifically for AI agents: **[DEPLOYMENT_FOR_AGENTS.md](./DEPLOYMENT_FOR_AGENTS.md)**.
-> To let an AI agent (OpenCode / Claude / Copilot, etc.) deploy this project automatically, feed it that document and have it follow the steps verbatim. Human operators should also refer to its verification checklist and troubleshooting table.
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/heshengtao/SoulX-FlashHead/main/DEPLOYMENT_FOR_AGENTS.md
+> ```
+>
+> Feed the output to your AI agent and let it deploy the project automatically.
 
 ## 🧩 Local Integration Features
 

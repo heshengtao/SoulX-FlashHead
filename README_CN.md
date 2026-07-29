@@ -17,10 +17,13 @@
 
 <p align="right"><a href="./README.md">English</a> | <b>中文</b></p>
 
-> **🤖 给用户和 AI Agent 的重要提示**
+> **🤖 使用 AI 编程助手（OpenCode、Claude Code 等）？**
 >
-> 本项目包含一份专为 AI Agent 编写的自动化部署文档：**[DEPLOYMENT_FOR_AGENTS.md](./DEPLOYMENT_FOR_AGENTS.md)**。
-> 如果你希望让 AI（如 OpenCode / Claude / Copilot 等）自动完成本项目的部署，请把该文档交给 AI 阅读并让它严格按步骤执行；人工部署也请优先参考该文档中的验证清单与故障排查表。
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/heshengtao/SoulX-FlashHead/main/DEPLOYMENT_FOR_AGENTS.md
+> ```
+>
+> 将输出内容发给 AI 助手，让它自动完成项目部署。
 
 ## 🧩 本仓库的集成功能
 
