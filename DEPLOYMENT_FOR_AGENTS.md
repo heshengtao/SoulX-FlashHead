@@ -1,74 +1,75 @@
-# SoulX-FlashHead — AI Agent 自动部署指南
+# SoulX-FlashHead — AI Agent Automated Deployment Guide
 
-> 本文档面向 **AI Agent**（OpenCode / Claude / Copilot 等）与自动化脚本，目标是**无人值守地完成本项目的部署与验证**。
-> Agent 执行要求：严格按顺序执行；每一步都有"验证"环节，验证失败时先查[故障排查](#-故障排查)再继续，不要盲目重试。
+> This document is intended for **AI Agents** (OpenCode / Claude / Copilot, etc.) and automation scripts, with the goal of **unattended deployment and verification of this project**.
+> Agent execution requirements: follow steps in strict order; each step has a "verification" checkpoint; if verification fails, consult [Troubleshooting](#-troubleshooting) before retrying — do not blindly retry.
 
 ---
 
-## 0. 项目概况
+## 0. Project Overview
 
-- **是什么**：SoulX-FlashHead 实时流式数字人口型同步服务。FastAPI + WebSocket，监听 `ws://0.0.0.0:8765/ws/stream`。
-- **输入**：一张人物参考图 + 16kHz 音频流（base64，float32/int16/wav）。
-- **输出**：每块（chunk）24 帧 512×512 视频帧（JPEG 批量二进制包；启用抠图时为 WebP RGBA）。
-- **入口**：`streaming_server.py`（开发/自用）、`start_server.bat`（Windows 双击启动，使用 conda 环境 `flashhead`）。
-- **模型**：`SoulX-FlashHead-1_3B`（Lite 版单卡 RTX4090 可实时）+ `wav2vec2-base-960h`（音频编码器）。
-- **可选**：抠图模型（透明背景，默认 MODNet 6.5M 轻量模型，首次启用时自动下载；可通过环境变量切换回 RVM）。
+- **What it is**: SoulX-FlashHead real-time streaming talking-head lip-sync service. FastAPI + WebSocket, listening on `ws://0.0.0.0:8765/ws/stream`.
+- **Input**: One reference image + 16kHz audio stream (base64, float32/int16/wav).
+- **Output**: 24 frames of 512×512 video per chunk (JPEG batch binary packets; WebP RGBA when matting is enabled).
+- **Entry point**: `streaming_server.py` (dev/personal use), `start_server.bat` (Windows double-click launch, using conda env `flashhead`).
+- **Models**: `SoulX-FlashHead-1_3B` (Lite variant achieves real-time on single RTX 4090) + `wav2vec2-base-960h` (audio encoder).
+- **Optional**: Matting model (transparent background; MODNet 6.5M lightweight model by default, auto-downloaded on first use; switchable to RVM via env var).
 
-### 硬件/系统要求
+### Hardware / System Requirements
 
-| 项 | 要求 |
+| Item | Requirement |
 |---|---|
-| GPU | NVIDIA，Lite 版建议 ≥ 12GB VRAM（RTX 4090 级可 3 路并发） |
-| CUDA | 12.8（对应 torch 2.7.1+cu128） |
-| Python | 3.10（用 conda 管理，环境名固定为 `flashhead`） |
-| OS | Windows 10/11 或 Linux |
-| 磁盘 | 模型约 10GB+，预留 20GB |
+| GPU | NVIDIA, Lite variant recommends ≥ 12GB VRAM (RTX 4090-class supports 3 concurrent streams) |
+| CUDA | 12.8 (corresponding to torch 2.7.1+cu128) |
+| Python | 3.10 (managed via conda, env name fixed as `flashhead`) |
+| OS | Windows 10/11 or Linux |
+| Disk | Models ~10GB+, reserve 20GB |
 
 ---
 
-## 1. 环境准备
+## 1. Environment Setup
 
-### 1.1 创建 conda 环境
+### 1.1 Create conda environment
 
 ```bash
 conda create -n flashhead python=3.10 -y
 conda activate flashhead
 ```
 
-> Windows 下 `start_server.bat` 写死路径 `D:\anaconda\envs\flashhead\python.exe`。
-> 若你的 Anaconda 安装位置不同，请同步修改 `start_server.bat` 第 14 行的 `PYTHON` 变量。
+> On Windows, `start_server.bat` hardcodes the path `D:\anaconda\envs\flashhead\python.exe`.
+> If your Anaconda installation path differs, update the `PYTHON` variable on line 14 of `start_server.bat` accordingly.
 
-### 1.2 安装 PyTorch (CUDA 12.8)
+### 1.2 Install PyTorch (CUDA 12.8)
 
 ```bash
 pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
 ```
 
-验证：
+Verify:
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-# 期望: 2.7.1+cu128 True
+# Expected: 2.7.1+cu128 True
 ```
 
-### 1.3 安装其他依赖
+### 1.3 Install other dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 1.4 安装 FlashAttention
+### 1.4 Install FlashAttention
 
 ```bash
 pip install ninja
 pip install flash_attn==2.8.0.post2 --no-build-isolation
 ```
 
-> Windows 下源码编译极易失败。**推荐直接装预编译 wheel**：从
-> https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.0.post2
-> 下载与 `cu128 + torch2.7 + python3.10` 匹配的 `.whl`，然后 `pip install <下载的.whl>`。
+> Building from source on Windows is highly prone to failure. **Strongly recommended to install the prebuilt wheel**:
+> Download the `.whl` matching `cu128 + torch2.7 + python3.10` from
+> https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.0.post2,
+> then `pip install <downloaded.whl>`.
 
-### 1.5 SageAttention（可选，加速）
+### 1.5 SageAttention (optional, for acceleration)
 
 ```bash
 pip install sageattention==2.2.0 --no-build-isolation
@@ -85,10 +86,10 @@ apt-get install ffmpeg
 
 ---
 
-## 2. 下载模型权重
+## 2. Download Model Weights
 
 ```bash
-# 中国大陆先设置镜像：
+# For users in mainland China, set the mirror first:
 #   Windows PowerShell: $env:HF_ENDPOINT="https://hf-mirror.com"
 #   Linux/bash:         export HF_ENDPOINT=https://hf-mirror.com
 pip install "huggingface_hub[cli]"
@@ -96,90 +97,90 @@ huggingface-cli download Soul-AILab/SoulX-FlashHead-1_3B --local-dir ./models/So
 huggingface-cli download facebook/wav2vec2-base-960h --local-dir ./models/wav2vec2-base-960h
 ```
 
-验证目录结构：
+Verify directory structure:
 
 ```
 models/
 ├── SoulX-FlashHead-1_3B/
-│   ├── Model_Lite/      # config.json + 权重
+│   ├── Model_Lite/      # config.json + weights
 │   └── Model_Pro/
 └── wav2vec2-base-960h/
 ```
 
 ---
 
-## 3. 启动与验证
+## 3. Launch & Verification
 
-### 3.1 启动服务
+### 3.1 Start the server
 
 ```bash
-# 方式一（推荐 Windows）：双击或执行
+# Option 1 (recommended for Windows): double-click or run
 start_server.bat
 
-# 方式二：手动
+# Option 2: manual
 python streaming_server.py
 ```
 
-### 3.2 健康检查
+### 3.2 Health check
 
 ```bash
 curl http://127.0.0.1:8765/health
-# 期望: {"status":"ok", ...}
+# Expected: {"status":"ok", ...}
 ```
 
-浏览器打开 `http://127.0.0.1:8765/` 可见内置测试页，上传参考图+音频即可端到端验证。
+Open `http://127.0.0.1:8765/` in a browser to see the built-in test page. Upload a reference image + audio for end-to-end verification.
 
-### 3.3 环境变量（按需设置）
+### 3.3 Environment variables (set as needed)
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Description |
 |---|---|---|
-| `FLASHHEAD_CKPT_DIR` | `models/SoulX-FlashHead-1_3B` | 模型目录 |
-| `FLASHHEAD_WAV2VEC_DIR` | `models/wav2vec2-base-960h` | wav2vec 目录 |
+| `FLASHHEAD_CKPT_DIR` | `models/SoulX-FlashHead-1_3B` | Model directory |
+| `FLASHHEAD_WAV2VEC_DIR` | `models/wav2vec2-base-960h` | wav2vec directory |
 | `FLASHHEAD_MODEL_TYPE` | `lite` | `lite` / `pro` |
-| `FLASHHEAD_MAX_SESSIONS` | `2` | 最大并发会话 |
-| `FLASHHEAD_SEED` | `42` | 随机种子 |
-| `FLASHHEAD_MATTING` | `0` | `1` 时对所有会话强制开启抠图（默认 MODNet） |
+| `FLASHHEAD_MAX_SESSIONS` | `2` | Max concurrent sessions |
+| `FLASHHEAD_SEED` | `42` | Random seed |
+| `FLASHHEAD_MATTING` | `0` | `1` to force matting for all sessions (defaults to MODNet) |
 | `FLASHHEAD_MATTING_MODEL` | `modnet` | `modnet` / `rvm` |
-| `FLASHHEAD_MATTING_RVM_DS` | `0.5` | RVM 降采样比例（越小越快） |
-| `FLASHHEAD_MATTING_RVM_KI` | `5` | RVM 关键帧间隔（越大越快） |
-| `FLASHHEAD_SUB_BATCH` | `6` | 每子批次帧数（越大编码越快，首帧稍慢） |
-| `FLASHHEAD_WEBP_QUALITY` | `65` | WebP 编码质量（越小越快） |
+| `FLASHHEAD_MATTING_RVM_DS` | `0.5` | RVM downsample ratio (lower = faster) |
+| `FLASHHEAD_MATTING_RVM_KI` | `5` | RVM keyframe interval (higher = faster) |
+| `FLASHHEAD_SUB_BATCH` | `6` | Frames per sub-batch (higher = faster encoding, slightly slower first frame) |
+| `FLASHHEAD_WEBP_QUALITY` | `65` | WebP encoding quality (lower = faster) |
 
-### 3.4 预下载抠图模型（可选但推荐）
+### 3.4 Pre-download matting model (optional but recommended)
 
-透明背景（`transparent_bg`）首次启用时需下载抠图模型：
+Transparent background (`transparent_bg`) requires downloading the matting model on first use:
 
-- **MODNet**（默认，推荐）：约 25MB，从 HuggingFace 下载（`DavG25/modnet-pretrained-models`）。
-  首次启动服务时自动下载，也可提前执行：
+- **MODNet** (default, recommended): ~25 MB, downloaded from HuggingFace (`DavG25/modnet-pretrained-models`).
+  Downloaded automatically on first server start, or pre-download manually:
   ```bash
   python -c "from flash_head.utils.matting import MODNetMatting; MODNetMatting(device='cuda'); print('MODNet ready')"
   ```
-  需要外网访问 HuggingFace；在防火墙后需配置 `HTTPS_PROXY` 代理。
+  Requires internet access to HuggingFace; configure `HTTPS_PROXY` if behind a firewall.
 
-- **RVM**（备选）：约 14.5MB，从 GitHub 下载（`PeterL1n/RobustVideoMatting`）。
-  通过 `FLASHHEAD_MATTING_MODEL=rvm` 切换，也可预下载：
+- **RVM** (fallback): ~14.5 MB, downloaded from GitHub (`PeterL1n/RobustVideoMatting`).
+  Switch via `FLASHHEAD_MATTING_MODEL=rvm`, or pre-download:
   ```bash
   python -c "import torch; torch.hub.load('PeterL1n/RobustVideoMatting', 'mobilenetv3', trust_repo=True); print('RVM ready')"
   ```
 
-- 下载位置：`C:\Users\<用户>\.cache\torch\hub\checkpoints\`（Linux 为 `~/.cache/torch/hub/checkpoints/`）。
-- MODNet 加载失败会自动回退到 RVM；RVM 也失败则回退 JPEG（无透明背景）。
-- 手动备选（RVM）：下载 `https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3.pth` 放入 `<hub>\checkpoints\`。
+- Cache location: `C:\Users\<user>\.cache\torch\hub\checkpoints\` (Linux: `~/.cache/torch/hub/checkpoints/`).
+- If MODNet fails to load, it auto-falls-back to RVM; if RVM also fails, falls back to JPEG (no transparent background).
+- Manual alternative (RVM): download `https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3.pth` into `<hub>\checkpoints\`.
 
 ---
 
-## 4. WebSocket 协议速览（供集成方使用）
+## 4. WebSocket Protocol Overview (for integrators)
 
-端点：`ws://<host>:8765/ws/stream`。控制消息为 JSON 文本帧；视频帧为二进制帧。
+Endpoint: `ws://<host>:8765/ws/stream`. Control messages are JSON text frames; video frames are binary frames.
 
-### 4.1 客户端 → 服务端
+### 4.1 Client → Server
 
-**init**（连接后首条消息）：
+**init** (first message after connecting):
 
 ```json
 {
   "type": "init",
-  "cond_image": "<base64 图像字节 或 服务器本地路径/目录>",
+  "cond_image": "<base64 image bytes or server-side local path/directory>",
   "cond_is_path": false,
   "base_seed": 42,
   "use_face_crop": false,
@@ -187,58 +188,58 @@ curl http://127.0.0.1:8765/health
 }
 ```
 
-- `cond_is_path: true` 时 `cond_image` 是**服务器本地路径**；传**目录**则加载目录下全部 `*.png` 作为多个人物（person_name = 文件名去扩展名）。
-- `transparent_bg: true` 启用 RVM 抠图，输出 WebP RGBA 帧。
+- When `cond_is_path: true`, `cond_image` is a **server-side local path**; passing a **directory** loads all `*.png` files as multiple persons (person_name = filename without extension).
+- `transparent_bg: true` enables MODNet/RVM matting, outputting WebP RGBA frames.
 
-**audio_chunk**：`{"type":"audio_chunk","audio":"<base64>","audio_format":"float32"}`（float32/int16/wav，16kHz 单声道）
+**audio_chunk**: `{"type":"audio_chunk","audio":"<base64>","audio_format":"float32"}` (float32/int16/wav, 16kHz mono)
 
-**flush**：缓冲不足一块时补齐出帧（会话保持）。
-**clear**：丢弃缓冲音频。
-**reset**：`{"type":"reset","person_name":"<目录模式下的图片名>"}` 热切换人物。
-**finish**：冲洗剩余音频并结束会话。
+**flush**: Pad and emit frames when buffer is below one chunk (session kept alive).
+**clear**: Discard buffered audio.
+**reset**: `{"type":"reset","person_name":"<image name in directory mode>"}` hot-switch person.
+**finish**: Flush remaining audio and end session.
 
-### 4.2 服务端 → 客户端
+### 4.2 Server → Client
 
-- `ready`：`{type, session_id, frame_num:33, motion_frames_num:9, slice_len:24, chunk_audio_samples:15360, tgt_fps:25, sample_rate:16000, model_load_time_s}` — **不含宽高**，宽高在 `frames_meta` 里。
-- `frames_meta`：`{type, chunk_idx, frames_count, height, width, processing_time_ms, fmt}` — `fmt` 为 `jpeg` 或 `webp`（抠图启用时）。
-  紧随其后一条**二进制帧**，批量格式：`[4B count LE][4B len LE][encoded frame]...`
-- `flushed` / `cleared` / `reset_ok` / `finished`（汇总统计）/ `error`。
-
----
-
-## 5. 与 super-agent-party 集成
-
-1. 先按第 1-3 章完成部署并启动 `streaming_server.py`。
-2. super-agent-party 主界面 → 设置 → **SoulX 桌宠机器人**：
-   - 服务地址默认 `ws://127.0.0.1:8765`；
-   - 上传一张或多张参考图（存于 party 用户数据目录 `uploaded_files/soulx_images/`）；
-   - 下拉选择要使用的形象；
-   - "透明背景"开关对应 `transparent_bg`（需已完成 3.4）。
-3. 点击启动按钮打开 SoulX 桌宠窗口。
-   - **本机服务**时 party 使用目录模式 init，ready 后自动 `reset` 到选中形象；**远程服务**自动回退为 base64 单图模式。
-   - 窗口控制面板含 Anime4K ×2 超分开关（客户端 WebGPU，无需服务端配合）。
+- `ready`: `{type, session_id, frame_num:33, motion_frames_num:9, slice_len:24, chunk_audio_samples:15360, tgt_fps:25, sample_rate:16000, model_load_time_s}` — **width/height not included**, those are in `frames_meta`.
+- `frames_meta`: `{type, chunk_idx, frames_count, height, width, processing_time_ms, fmt}` — `fmt` is `jpeg` or `webp` (when matting is active).
+  Immediately followed by one **binary frame** message, batch format: `[4B count LE][4B len LE][encoded frame]...`
+- `flushed` / `cleared` / `reset_ok` / `finished` (summary stats) / `error`.
 
 ---
 
-## 6. ✅ 部署验证清单（Agent 必查）
+## 5. Integration with super-agent-party
 
-- [ ] `python -c "import torch; print(torch.cuda.is_available())"` 输出 `True`
-- [ ] `python -c "import flash_attn"` 无异常
-- [ ] `models/SoulX-FlashHead-1_3B` 与 `models/wav2vec2-base-960h` 存在且非空
-- [ ] `curl http://127.0.0.1:8765/health` 返回 ok
-- [ ] （启用抠图时）`~/.cache/torch/hub/checkpoints/modnet_mobilenetv2.pth` 或 `rvm_mobilenetv3.pth` 存在
-- [ ] 内置测试页 (`http://127.0.0.1:8765/`) 可生成视频
+1. Complete deployment via chapters 1-3 and start `streaming_server.py`.
+2. super-agent-party main UI → Settings → **SoulX Desktop Pet Bot**:
+   - Default service address: `ws://127.0.0.1:8765`;
+   - Upload one or more reference images (stored in party user data directory `uploaded_files/soulx_images/`);
+   - Select the persona to use from the dropdown;
+   - The "Transparent Background" toggle corresponds to `transparent_bg` (requires completing 3.4).
+3. Click the start button to open the SoulX desktop pet window.
+   - **Local service**: party uses directory-mode init, auto-`reset`s to the selected persona after ready; **remote service**: auto-falls-back to base64 single-image mode.
+   - Window control panel includes an Anime4K ×2 upscaling toggle (client-side WebGPU, no server-side support needed).
 
-## 🔧 故障排查
+---
 
-| 症状 | 原因/处理 |
+## 6. ✅ Deployment Verification Checklist (Agent must check)
+
+- [ ] `python -c "import torch; print(torch.cuda.is_available())"` outputs `True`
+- [ ] `python -c "import flash_attn"` runs without error
+- [ ] `models/SoulX-FlashHead-1_3B` and `models/wav2vec2-base-960h` exist and are non-empty
+- [ ] `curl http://127.0.0.1:8765/health` returns ok
+- [ ] (If matting is enabled) `~/.cache/torch/hub/checkpoints/modnet_mobilenetv2.pth` or `rvm_mobilenetv3.pth` exists
+- [ ] Built-in test page (`http://127.0.0.1:8765/`) can generate video
+
+## 🔧 Troubleshooting
+
+| Symptom | Cause / Resolution |
 |---|---|
-| `torch.cuda.is_available()` 为 False | torch 版本与 CUDA 不匹配，重装 cu128 版本 |
-| flash_attn 编译失败（Windows） | 改用官方 release 的预编译 wheel（见 1.4） |
-| 启动报 OOM / 会话被回收 | 降低 `FLASHHEAD_MAX_SESSIONS`；确认无其他进程占显存 |
-| 首次抠图卡住很久 | 抠图模型正在下载（MODNet ~25MB 需 HuggingFace；RVM ~14.5MB 需 GitHub），见 3.4 预下载 |
-| 抠图无效输出仍为 JPEG | 查看服务端日志 `Matting model loaded` 确认成功；若 MODNet 加载失败会自动回退 RVM，都失败才回退 JPEG。可强制开启 `FLASHHEAD_MATTING=1` |
-| MODNet 下载失败 | 确认 `HTTPS_PROXY` 代理已配置（如 `http://127.0.0.1:7892`）；或切换到 RVM `FLASHHEAD_MATTING_MODEL=rvm` |
-| 目录模式人物名不生效 | person_name 必须等于 PNG 文件名（不含扩展名），文件名不要含 `.` 与空格 |
-| huggingface 下载慢 | 设置 `HF_ENDPOINT=https://hf-mirror.com` |
-| 客户端超分按钮提示不可用 | 超分在客户端 WebGPU 执行，需 Chrome/Edge/Electron 支持 WebGPU；与服务端无关 |
+| `torch.cuda.is_available()` returns False | torch version mismatch with CUDA; reinstall cu128 version |
+| flash_attn build fails (Windows) | Use the official release prebuilt wheel (see 1.4) |
+| Server starts with OOM / session gets evicted | Lower `FLASHHEAD_MAX_SESSIONS`; ensure no other processes are consuming VRAM |
+| First-time matting hangs for a long time | Matting model is downloading (MODNet ~25MB from HuggingFace; RVM ~14.5MB from GitHub), see 3.4 for pre-download |
+| Matting has no effect, output is still JPEG | Check server log for `Matting model loaded`; if MODNet fails it auto-falls-back to RVM, JPEG only if both fail. Force with `FLASHHEAD_MATTING=1` |
+| MODNet download fails | Confirm `HTTPS_PROXY` proxy is configured (e.g., `http://127.0.0.1:7892`); or switch to RVM via `FLASHHEAD_MATTING_MODEL=rvm` |
+| Directory-mode person name doesn't work | person_name must match the PNG filename (without extension); avoid `.` and spaces in filenames |
+| HuggingFace download is slow | Set `HF_ENDPOINT=https://hf-mirror.com` |
+| Client upscaling button shows unavailable | Upscaling runs on client WebGPU; requires Chrome/Edge/Electron with WebGPU support; unrelated to server |
