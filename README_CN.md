@@ -27,7 +27,7 @@
 > 以下为本仓库在官方版本基础上增加的集成功能，主要用于配合 [super-agent-party](https://github.com/heshengtao/super-agent-party) 桌宠。
 
 - **多参考图目录模式（Directory Mode）**：`init` 消息的 `cond_image` 支持传入**目录路径**（`cond_is_path: true`），服务端会加载目录下全部 `*.png` 作为多个人物形象；之后发送 `{"type":"reset","person_name":"<文件名去扩展名>"}` 即可**热切换人物**，无需重新初始化。
-- **透明背景 / 服务端抠图（RVM Matting）**：`init` 消息新增 `transparent_bg: bool`（或设置环境变量 `FLASHHEAD_MATTING=1`）。启用后服务端使用 RVM (Robust Video Matting, MobileNetV3) 对每帧实时抠图，帧编码从 JPEG 切换为 **WebP (RGBA 带 alpha)**；`frames_meta` 消息新增 `fmt` 字段（`jpeg` / `webp`）告知客户端当前编码格式。抠图模型在首次启用时通过 torch.hub 自动下载（约 14.5MB），失败自动回退 JPEG。
+- **透明背景 / 服务端抠图（Matting）**：`init` 消息新增 `transparent_bg: bool`（或设置环境变量 `FLASHHEAD_MATTING=1`）。启用后服务端使用 MODNet（6.5M 轻量模型，默认）或 RVM（备选，自动回退）对每帧实时抠图，帧编码从 JPEG 切换为 **WebP (RGBA 带 alpha)**；`frames_meta` 消息新增 `fmt` 字段（`jpeg` / `webp`）告知客户端当前编码格式。抠图模型首次启用时自动下载，失败自动回退 JPEG。通过 `FLASHHEAD_MATTING_MODEL` 切换模型（`modnet` / `rvm`）。
 - **Windows 路径修复**：目录模式下 person_name 解析在 Windows 上原本会得到完整路径，已修复为 `os.path.basename`。
 
 协议细节见 [API.md](./API.md) 与 [DEPLOYMENT_FOR_AGENTS.md](./DEPLOYMENT_FOR_AGENTS.md)。

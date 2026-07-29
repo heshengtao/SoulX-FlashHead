@@ -12,7 +12,7 @@
 - **输出**：每块（chunk）24 帧 512×512 视频帧（JPEG 批量二进制包；启用抠图时为 WebP RGBA）。
 - **入口**：`streaming_server.py`（开发/自用）、`start_server.bat`（Windows 双击启动，使用 conda 环境 `flashhead`）。
 - **模型**：`SoulX-FlashHead-1_3B`（Lite 版单卡 RTX4090 可实时）+ `wav2vec2-base-960h`（音频编码器）。
-- **可选**：RVM 抠图模型（透明背景，首次启用时自动下载，可提前预下载，见 3.4）。
+- **可选**：抠图模型（透明背景，默认 MODNet 6.5M 轻量模型，首次启用时自动下载；可通过环境变量切换回 RVM）。
 
 ### 硬件/系统要求
 
@@ -138,25 +138,33 @@ curl http://127.0.0.1:8765/health
 | `FLASHHEAD_MODEL_TYPE` | `lite` | `lite` / `pro` |
 | `FLASHHEAD_MAX_SESSIONS` | `2` | 最大并发会话 |
 | `FLASHHEAD_SEED` | `42` | 随机种子 |
-| `FLASHHEAD_MATTING` | `0` | `1` 时对所有会话强制开启 RVM 抠图 |
+| `FLASHHEAD_MATTING` | `0` | `1` 时对所有会话强制开启抠图（默认 MODNet） |
+| `FLASHHEAD_MATTING_MODEL` | `modnet` | `modnet` / `rvm` |
+| `FLASHHEAD_MATTING_RVM_DS` | `0.5` | RVM 降采样比例（越小越快） |
+| `FLASHHEAD_MATTING_RVM_KI` | `5` | RVM 关键帧间隔（越大越快） |
+| `FLASHHEAD_SUB_BATCH` | `6` | 每子批次帧数（越大编码越快，首帧稍慢） |
+| `FLASHHEAD_WEBP_QUALITY` | `65` | WebP 编码质量（越小越快） |
 
-### 3.4 预下载 RVM 抠图模型（可选但推荐）
+### 3.4 预下载抠图模型（可选但推荐）
 
-透明背景（`transparent_bg`）首次启用时会通过 torch.hub 自动下载 RVM 代码与权重（约 14.5MB，需访问 GitHub）。
-建议部署时**提前预下载**，避免首次使用时等待：
+透明背景（`transparent_bg`）首次启用时需下载抠图模型：
 
-```bash
-# conda 环境已激活时：
-python -c "import torch; torch.hub.load('PeterL1n/RobustVideoMatting', 'mobilenetv3', trust_repo=True); print('RVM ready')"
+- **MODNet**（默认，推荐）：约 25MB，从 HuggingFace 下载（`DavG25/modnet-pretrained-models`）。
+  首次启动服务时自动下载，也可提前执行：
+  ```bash
+  python -c "from flash_head.utils.matting import MODNetMatting; MODNetMatting(device='cuda'); print('MODNet ready')"
+  ```
+  需要外网访问 HuggingFace；在防火墙后需配置 `HTTPS_PROXY` 代理。
 
-# Windows 未激活环境时可直接调用解释器（按实际 conda 路径调整）：
-D:\anaconda\envs\flashhead\python.exe -c "import torch; torch.hub.load('PeterL1n/RobustVideoMatting', 'mobilenetv3', trust_repo=True); print('RVM ready')"
-```
+- **RVM**（备选）：约 14.5MB，从 GitHub 下载（`PeterL1n/RobustVideoMatting`）。
+  通过 `FLASHHEAD_MATTING_MODEL=rvm` 切换，也可预下载：
+  ```bash
+  python -c "import torch; torch.hub.load('PeterL1n/RobustVideoMatting', 'mobilenetv3', trust_repo=True); print('RVM ready')"
+  ```
 
-- 下载位置：`C:\Users\<用户>\.cache\torch\hub\`（Linux 为 `~/.cache/torch/hub/`）。代码与权重都缓存在此，之后完全离线可用。
-- 该下载发生在**本项目的 Python 环境/当前 OS 用户的全局 torch 缓存**中，不会改动任何其他项目（例如 super-agent-party）的文件或依赖。
-- GitHub 较慢时可先配置代理，或多试几次（checkpoint 不支持断点续传，失败会重新下载，属正常现象）。
-- 手动备选：下载 `https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3.pth` 放入 `<hub>\checkpoints\`，再执行上面的命令让它完成 repo 检出。
+- 下载位置：`C:\Users\<用户>\.cache\torch\hub\checkpoints\`（Linux 为 `~/.cache/torch/hub/checkpoints/`）。
+- MODNet 加载失败会自动回退到 RVM；RVM 也失败则回退 JPEG（无透明背景）。
+- 手动备选（RVM）：下载 `https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3.pth` 放入 `<hub>\checkpoints\`。
 
 ---
 
@@ -218,7 +226,7 @@ D:\anaconda\envs\flashhead\python.exe -c "import torch; torch.hub.load('PeterL1n
 - [ ] `python -c "import flash_attn"` 无异常
 - [ ] `models/SoulX-FlashHead-1_3B` 与 `models/wav2vec2-base-960h` 存在且非空
 - [ ] `curl http://127.0.0.1:8765/health` 返回 ok
-- [ ] （启用抠图时）`~/.cache/torch/hub/checkpoints/rvm_mobilenetv3.pth` 存在
+- [ ] （启用抠图时）`~/.cache/torch/hub/checkpoints/modnet_mobilenetv2.pth` 或 `rvm_mobilenetv3.pth` 存在
 - [ ] 内置测试页 (`http://127.0.0.1:8765/`) 可生成视频
 
 ## 🔧 故障排查
@@ -228,8 +236,9 @@ D:\anaconda\envs\flashhead\python.exe -c "import torch; torch.hub.load('PeterL1n
 | `torch.cuda.is_available()` 为 False | torch 版本与 CUDA 不匹配，重装 cu128 版本 |
 | flash_attn 编译失败（Windows） | 改用官方 release 的预编译 wheel（见 1.4） |
 | 启动报 OOM / 会话被回收 | 降低 `FLASHHEAD_MAX_SESSIONS`；确认无其他进程占显存 |
-| 首次抠图卡住很久 | RVM 正在从 GitHub 下载（约 14.5MB），见 3.4 预下载 |
-| 抠图无效输出仍为 JPEG | 查看服务端日志 `RVM matting unavailable`；确认权重下载成功；也可用 `FLASHHEAD_MATTING=1` 强制开启 |
+| 首次抠图卡住很久 | 抠图模型正在下载（MODNet ~25MB 需 HuggingFace；RVM ~14.5MB 需 GitHub），见 3.4 预下载 |
+| 抠图无效输出仍为 JPEG | 查看服务端日志 `Matting model loaded` 确认成功；若 MODNet 加载失败会自动回退 RVM，都失败才回退 JPEG。可强制开启 `FLASHHEAD_MATTING=1` |
+| MODNet 下载失败 | 确认 `HTTPS_PROXY` 代理已配置（如 `http://127.0.0.1:7892`）；或切换到 RVM `FLASHHEAD_MATTING_MODEL=rvm` |
 | 目录模式人物名不生效 | person_name 必须等于 PNG 文件名（不含扩展名），文件名不要含 `.` 与空格 |
 | huggingface 下载慢 | 设置 `HF_ENDPOINT=https://hf-mirror.com` |
 | 客户端超分按钮提示不可用 | 超分在客户端 WebGPU 执行，需 Chrome/Edge/Electron 支持 WebGPU；与服务端无关 |

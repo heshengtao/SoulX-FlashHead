@@ -67,7 +67,7 @@ Send:
 | `model_type` | string | `"lite"` | `"lite"` (RTX 4080+) or `"pro"` (2× RTX 5090) |
 | `base_seed` | int | `42` | Random seed for deterministic output |
 | `use_face_crop` | bool | `false` | Enable face detection and auto-crop |
-| `transparent_bg` | bool | `false` | Enable server-side RVM matting; frames are then encoded as WebP with alpha (see `fmt` in `frames_meta`). Can also be forced via env `FLASHHEAD_MATTING=1` |
+| `transparent_bg` | bool | `false` | Enable server-side matting (MODNet by default, auto-fallback to RVM); frames are then encoded as WebP with alpha (see `fmt` in `frames_meta`). Can also be forced via env `FLASHHEAD_MATTING=1` |
 
 Receive:
 ```json
@@ -277,6 +277,12 @@ asyncio.run(main())
 | `FLASHHEAD_MODEL_TYPE` | `lite` | `lite` or `pro` |
 | `FLASHHEAD_MAX_SESSIONS` | `2` | Max concurrent WebSocket sessions |
 | `FLASHHEAD_SEED` | `42` | Default random seed |
+| `FLASHHEAD_MATTING` | `0` | `1` to force matting for all sessions |
+| `FLASHHEAD_MATTING_MODEL` | `modnet` | `modnet` (lightweight, 6.5M) or `rvm` (robust video matting) |
+| `FLASHHEAD_MATTING_RVM_DS` | `0.5` | RVM downsample ratio (lower = faster) |
+| `FLASHHEAD_MATTING_RVM_KI` | `5` | RVM keyframe interval (higher = faster) |
+| `FLASHHEAD_SUB_BATCH` | `6` | Frames per sub-batch (higher = faster encoding) |
+| `FLASHHEAD_WEBP_QUALITY` | `65` | WebP quality when matting is active |
 | `CUDA_VISIBLE_DEVICES` | `0` | GPU device ID |
 
 ## Benchmark Script
